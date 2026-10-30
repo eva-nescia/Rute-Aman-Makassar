@@ -5,13 +5,33 @@ with UCS and BFS as baselines. Built for the Artificial Intelligence course, Uni
 
 ## Run
 
+With [uv](https://docs.astral.sh/uv/) (no install step needed):
+
+```
+uv run --with openpyxl main.py            # interactive app (Tkinter)
+uv run --with openpyxl main.py --eval     # run the 8 test scenarios + 10 random accident simulations
+```
+
+Or with pip:
+
 ```
 pip install -r requirements.txt
-python main.py            # interactive app (Tkinter)
-python main.py --eval     # run the 8 test scenarios + 10 random accident simulations
+python main.py
+python main.py --eval
 ```
 
 Tkinter ships with the standard Python installer on Windows and macOS. On Ubuntu/Debian: `sudo apt install python3-tk`.
+
+## Start and destination
+
+| ID | Location | Start | Destination |
+|---|---|---|---|
+| UC | Universitas Ciputra Makassar | yes | yes |
+| MP | Mall Panakkukang | yes | yes |
+| Mari | Mall Ratu Indah | no | yes |
+| TSM | Trans Studio Mall | no | yes |
+
+The chosen start is removed from the destination list. The map is drawn as a road-network diagram from each node's `x_km`, `y_km`; there is no background image.
 
 ## How to use the app
 
