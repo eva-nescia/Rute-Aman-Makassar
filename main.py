@@ -7,6 +7,9 @@ Data dibaca langsung dari berkas .xlsx di folder data/ (sheet Parameters, Nodes,
 Edges, Hazard Locations, Test Scenarios). Tanpa .xlsx, program membaca CSV dengan
 nama sheet yang sama (nodes.csv, edges.csv, ...).
 Peta digambar sebagai skema jaringan jalan dari kolom x_km, y_km pada sheet Nodes.
+Latar peta (opsional): data/peta.png + kolom x_px, y_px pada sheet Nodes (posisi piksel
+simpul di gambar, minimal 2 simpul). Butuh Pillow.
+--eval juga menyimpan hasil ke hasil_evaluasi.xlsx.
 """
 import csv
 import heapq
@@ -43,6 +46,14 @@ def num(s):
     return float(s.replace(",", "."))
 
 
+def opt_num(s):
+    """Angka, atau None bila sel kosong / bukan angka (untuk kolom opsional)."""
+    try:
+        return num(s) if str(s).strip() else None
+    except ValueError:
+        return None
+
+
 _WB = {}
 
 
@@ -75,7 +86,9 @@ def read_table(name):
     if not os.path.exists(csv_path):
         return []
     with open(csv_path, newline="", encoding="utf-8-sig") as f:
-        return [{k.strip(): (v or "").strip() for k, v in r.items()} for r in csv.DictReader(f)]
+        rows = [{(k or "").strip(): (v or "").strip() for k, v in r.items()} for r in csv.DictReader(f)]
+    # sama seperti pembacaan .xlsx: baris kosong / baris catatan (< 2 sel terisi) dilewati
+    return [r for r in rows if sum(bool(v) for v in r.values()) >= 2]
 
 
 def get(row, prefix, default=""):
@@ -89,6 +102,7 @@ def get(row, prefix, default=""):
 class Graph:
     def __init__(self, nodes, edges):
         self.nodes, self.edges = nodes, edges
+        self.view = None            # diisi layout(): ukuran kanvas, skala, dan offset gambar
         self.adj = {n: [] for n in nodes}
         for e in edges.values():
             self.adj[e["a"]].append((e["b"], e["id"]))
@@ -108,6 +122,7 @@ def load_graph():
             id=r["node_id"], name=r["name"],
             kind="location" if r["type"].lower().startswith("start") else "junction",
             kx=num(get(r, "x_km")), ky=num(get(r, "y_km")),
+            px=opt_num(get(r, "x_px")), py=opt_num(get(r, "y_px")),
             can_start=r.get("role", "").lower().startswith("start"))
     for r in read_table("Edges"):
         edges[r["edge_id"]] = dict(id=r["edge_id"], a=r["from"], b=r["to"],
@@ -129,6 +144,53 @@ def check_heuristic(g):
     """Heuristik admissible bila garis lurus <= jarak jalan pada setiap ruas."""
     return [e["id"] for e in g.edges.values()
             if straight_km(g, e["a"], e["b"]) > e["dist"] + 1e-9]
+
+
+MAP_FILES = ("peta.png", "map.png", "peta.jpg", "map.jpg")
+
+
+def fit_axis(pairs):
+    """Regresi linear px = a * km + b dari pasangan (km, px)."""
+    n = len(pairs)
+    mean_k = sum(k for k, _ in pairs) / n
+    mean_p = sum(p for _, p in pairs) / n
+    var = sum((k - mean_k) ** 2 for k, _ in pairs)
+    if var < 1e-12:
+        return None
+    a = sum((k - mean_k) * (p - mean_p) for k, p in pairs) / var
+    return a, mean_p - a * mean_k
+
+
+def load_background(g):
+    """Latar peta opsional: data/peta.png + kolom x_px, y_px (posisi piksel simpul di gambar).
+
+    Minimal 2 simpul (beda posisi kiri-kanan dan atas-bawah) harus diisi x_px, y_px.
+    Hasil: (dict latar atau None, pesan)."""
+    path = next((os.path.join(DATA, f) for f in MAP_FILES if os.path.exists(os.path.join(DATA, f))), None)
+    if not path:
+        return None, ""
+    name = os.path.basename(path)
+    pts = [n for n in g.nodes.values() if n["px"] is not None and n["py"] is not None]
+    fx = fit_axis([(n["kx"], n["px"]) for n in pts]) if len(pts) >= 2 else None
+    fy = fit_axis([(n["ky"], n["py"]) for n in pts]) if len(pts) >= 2 else None
+    if not fx or not fy:
+        return None, (f"Latar peta {name} tidak dipakai: isi kolom x_px dan y_px pada sheet Nodes "
+                      f"untuk minimal 2 simpul yang posisinya berbeda.")
+    if fx[0] <= 0 or fy[0] >= 0:
+        return None, f"Latar peta {name} tidak dipakai: x_px/y_px tidak cocok dengan arah x_km (timur)/y_km (utara)."
+    try:
+        from PIL import Image
+    except ImportError:
+        return None, f"Latar peta {name} tidak dipakai: pasang Pillow (pip install pillow)."
+    try:
+        img = Image.open(path).convert("RGBA")
+    except Exception as exc:                  # berkas rusak / bukan gambar: jalan tanpa latar
+        return None, f"Latar peta {name} tidak dipakai: gambar tidak bisa dibuka ({exc.__class__.__name__})."
+    # sedikit dipudarkan supaya garis jalan dan rute tetap menonjol di atas peta
+    img = Image.blend(img, Image.new("RGBA", img.size, (255, 255, 255, 255)), 0.35)
+    err = max(max(abs(fx[0] * n["kx"] + fx[1] - n["px"]), abs(fy[0] * n["ky"] + fy[1] - n["py"])) for n in pts)
+    return (dict(image=img, ax=fx[0], bx=fx[1], ay=fy[0], by=fy[1], name=name, error_px=err),
+            f"Latar peta: {name}, dikalibrasi dari {len(pts)} simpul (selisih terbesar {err:.0f} px).")
 
 
 def hazard_defaults():
@@ -157,7 +219,8 @@ def load_scenarios():
             dis = {e: (htype.split()[0], CLOSED if level.startswith("ditutup") else level)
                    for e in edges}
         out.append(dict(id=r["ID"], name=r["scenario"], start=r["start"], goal=r["goal"],
-                        dis=dis, expected=r.get("cost with hazard", "")))
+                        dis=dis, expected=r.get("cost with hazard", ""),
+                        expected_changed=r.get("route changed?", "")))
     return out
 
 
@@ -265,80 +328,208 @@ def fc(x):
 
 
 # ----------------------------------------------------------- evaluation
+RESULT_FILE = os.path.join(BASE, "hasil_evaluasi.xlsx")   # di luar data/ agar tidak terbaca sebagai dataset
+
+
+def same_cost(x, y):
+    return x == y or abs(x - y) < 1e-9
+
+
+def passes(res, dis, closed):
+    """Ruas pada rute yang ditutup (closed=True) atau berpenalti ringan/berat (closed=False)."""
+    return [e for e in res["edges"] if e in dis and (dis[e][1] == CLOSED) == closed]
+
+
+def route_change(g, s, t, dis, res, algo="A*"):
+    """(berubah?, responsnya tepat?) dibanding rute A* tanpa gangguan.
+
+    Tepat = rute hanya berubah bila ada gangguan pada rute terbaik semula, dan rute
+    pasti berubah bila salah satu ruas rute terbaik semula ditutup."""
+    base = ALGOS[algo](g, s, t, {})
+    changed = not res["found"] or res["nodes"] != base["nodes"]
+    hit = [e for e in base["edges"] if e in dis]
+    must_change = any(dis[e][1] == CLOSED for e in hit)
+    return changed, (not changed or bool(hit)) and (changed or not must_change)
+
+
+def change_text(res, changed):
+    return "Tidak ada rute" if not res["found"] else "Ya" if changed else "Tidak"
+
+
 def evaluate(g):
     scenarios = load_scenarios()
     if not scenarios:
         print("Sheet Test Scenarios kosong atau tidak ada.")
         return
-    print(f"{'ID':<4}{'Skenario':<30}{'Harap':>7}{'UCS':>8}{'A*':>8}{'BFS':>8}"
-          f"{'Opt':>5}{'Ubah':>6}{'Aman':>6}{'Eks B/U/A':>12}{'ms A*':>8}")
-    n_opt = n_safe = n_exp = n_exp_ok = bfs_opt = 0
+    print(f"{'ID':<3}{'Skenario':<27}{'Harap':>6}{'UCS':>7}{'A*':>7}{'BFS':>7}{'Opt':>4}"
+          f"{'Berubah':>16}{'Resp':>5}{'Tutup':>6}{'Penalti B/U/A':>14}{'Eks B/U/A':>11}{'ms A*':>7}")
+    rows, summary = [], []
+    n_opt = n_closed_ok = n_exp = n_exp_ok = bfs_opt = n_resp = n_with_route = 0
+    pen_ids = {a: [] for a in ALGOS}
     exp_sum = dict.fromkeys(ALGOS, 0)
-    n_with_route = 0
     ms_sum = dict.fromkeys(ALGOS, 0.0)
     for sc in scenarios:
         s, t, dis = sc["start"], sc["goal"], sc["dis"]
         res = {a: run_algo(a, g, s, t, dis) for a in ALGOS}
-        base = ALGOS["A*"](g, s, t, {})
-        same = lambda x, y: x == y or abs(x - y) < 1e-9
-        opt = same(res["A*"]["cost"], res["UCS"]["cost"])
-        changed = res["A*"]["nodes"] != base["nodes"]
-        safe = all(dis.get(e, (0, ""))[1] != CLOSED for e in res["A*"]["edges"])
+        a_star, ucs = res["A*"], res["UCS"]
+        has_route = a_star["found"]
+        opt = same_cost(a_star["cost"], ucs["cost"])
+        changed, resp = route_change(g, s, t, dis, a_star)
+        if sc["expected_changed"]:            # bandingkan juga dengan kolom 'route changed?'
+            resp = resp and sc["expected_changed"].lower().startswith("y") == changed
+        no_closed = not passes(a_star, dis, True)
+        pen = {a: passes(res[a], dis, False) for a in ALGOS}
         mark = "-"
         if sc["expected"]:
-            ok = same(num(sc["expected"]), res["UCS"]["cost"]) or \
-                abs(num(sc["expected"]) - res["UCS"]["cost"]) < 0.011
+            ok = abs(num(sc["expected"]) - ucs["cost"]) < 0.011 or same_cost(num(sc["expected"]), ucs["cost"])
             mark = "OK" if ok else "X"
             n_exp += 1
             n_exp_ok += ok
-        has_route = res["A*"]["found"]
-        n_safe += safe
+        n_closed_ok += no_closed
+        n_resp += resp
+        n_with_route += has_route
         if has_route:
             n_opt += opt
-            bfs_opt += same(res["BFS"]["cost"], res["UCS"]["cost"])
-        n_with_route += has_route
+            bfs_opt += same_cost(res["BFS"]["cost"], ucs["cost"])
         for a in ALGOS:
+            if pen[a]:
+                pen_ids[a].append(sc["id"])
             if has_route:
                 exp_sum[a] += res[a]["expanded"]
             ms_sum[a] += res[a]["ms"]
-        print(f"{sc['id']:<4}{sc['name'][:28]:<30}{mark:>7}{fc(res['UCS']['cost']):>8}"
-              f"{fc(res['A*']['cost']):>8}{fc(res['BFS']['cost']):>8}"
-              f"{'Y' if opt else 'N':>5}{'Y' if changed else 'N':>6}{'Y' if safe else 'N':>6}"
-              f"{res['BFS']['expanded']:>5}/{res['UCS']['expanded']}/{res['A*']['expanded']:<3}"
-              f"{res['A*']['ms']:>8.3f}")
+            rows.append([sc["id"], sc["name"], s, t, a, " > ".join(res[a]["nodes"]) or "Tidak ada rute",
+                         res[a]["dist"], res[a]["cost"], res[a]["expanded"], round(res[a]["ms"], 4),
+                         "Ya" if same_cost(res[a]["cost"], ucs["cost"]) else "Tidak",
+                         ", ".join(passes(res[a], dis, True)) or "-", ", ".join(pen[a]) or "-",
+                         change_text(res[a], route_change(g, s, t, dis, res[a], a)[0])])
+        yn = lambda b: "Y" if b else "N"
+        print(f"{sc['id']:<3}{sc['name'][:25]:<27}{mark:>6}{fc(ucs['cost']):>7}{fc(a_star['cost']):>7}"
+              f"{fc(res['BFS']['cost']):>7}{yn(opt):>4}{change_text(a_star, changed):>16}"
+              f"{'OK' if resp else 'X':>5}{'OK' if no_closed else 'X':>6}"
+              f"{yn(pen['BFS'][:1]) + '/' + yn(pen['UCS'][:1]) + '/' + yn(pen['A*'][:1]):>14}"
+              f"{str(res['BFS']['expanded']) + '/' + str(ucs['expanded']) + '/' + str(a_star['expanded']):>11}"
+              f"{a_star['ms']:>7.3f}")
     n = len(scenarios)
-    print(f"\nOptimalitas A* terhadap UCS : {n_opt}/{n_with_route} (skenario yang punya rute)")
-    print(f"BFS optimal                 : {bfs_opt}/{n_with_route} (skenario yang punya rute)")
-    print(f"Rute A* tidak melewati ruas ditutup: {n_safe}/{n}")
-    if n_exp:
-        print(f"Cocok dengan biaya di sheet Test Scenarios: {n_exp_ok}/{n_exp}")
-    print(f"Rata-rata simpul diekspansi dihitung dari {n_with_route} skenario yang punya rute "
-          f"(skenario tanpa rute tidak ikut dirata-rata):")
+    summary += [
+        ("Optimalitas A* (biaya A* = UCS)", f"{n_opt}/{n_with_route} skenario yang punya rute"),
+        ("BFS optimal", f"{bfs_opt}/{n_with_route} skenario yang punya rute"),
+        ("Keamanan: rute A* tidak melewati ruas ditutup", f"{n_closed_ok}/{n}"),
+    ]
     for a in ALGOS:
-        print(f"{a:<4} rata-rata simpul diekspansi {exp_sum[a] / max(n_with_route, 1):5.1f} "
-              f"| rata-rata waktu {ms_sum[a] / n:.3f} ms (semua {n} skenario)")
-    simulate_accidents(g)
+        ids = ", ".join(pen_ids[a]) or "-"
+        summary.append((f"Keamanan: rute {a} melewati ruas berpenalti", f"{len(pen_ids[a])}/{n} (skenario {ids})"))
+    summary.append(("Ketepatan respons A*", f"{n_resp}/{n} (rute berubah hanya bila gangguan ada di rute "
+                                            f"terbaik; cocok dengan kolom 'route changed?')"))
+    if n_exp:
+        summary.append(("Cocok dengan biaya di sheet Test Scenarios", f"{n_exp_ok}/{n_exp}"))
+    for a in ALGOS:
+        summary.append((f"{a} rata-rata simpul diekspansi", f"{exp_sum[a] / max(n_with_route, 1):.1f} "
+                                                           f"({n_with_route} skenario yang punya rute)"))
+    for a in ALGOS:
+        summary.append((f"{a} rata-rata waktu", f"{ms_sum[a] / n:.3f} ms ({TIMING_RUNS}x per skenario)"))
+    print()
+    for k, v in summary:
+        print(f"{k:<46}: {v}")
+    sim = simulate_accidents(g)
+    check = route_check(g)
+    save_results(rows, summary, sim, check)
 
 
 def simulate_accidents(g, n=10, seed=42):
     """Kecelakaan acak (ruas mana pun, ringan/berat) pada rute UC -> MP, seed tetap."""
     s, t = "UC", "MP"
     if s not in g.nodes or t not in g.nodes:
-        return
+        return []
     rnd = random.Random(seed)
     edge_ids = list(g.edges)
     base = ALGOS["A*"](g, s, t, {})
     print(f"\nSimulasi kecelakaan acak UC -> MP (seed {seed}), biaya dasar {fc(base['cost'])}:")
-    ok = 0
+    ok = n_resp = 0
+    rows = []
     for k in range(1, n + 1):
         eid, level = rnd.choice(edge_ids), rnd.choice(["ringan", "berat"])
         dis = {eid: ("kecelakaan", level)}
         a, u = ALGOS["A*"](g, s, t, dis), ALGOS["UCS"](g, s, t, dis)
-        same = a["cost"] == u["cost"] or abs(a["cost"] - u["cost"]) < 1e-9
+        same = same_cost(a["cost"], u["cost"])
+        changed, resp = route_change(g, s, t, dis, a)
         ok += same
-        print(f"  {k:>2}. {eid} {level:<7} A*={fc(a['cost'])} UCS={fc(u['cost'])} "
-              f"{'berubah' if a['nodes'] != base['nodes'] else 'tetap':<8}{'OK' if same else 'GAGAL'}")
-    print(f"  A* = UCS pada {ok}/{n} simulasi")
+        n_resp += resp
+        on_base = "di rute" if eid in base["edges"] else "di luar rute"
+        rows.append([k, eid, level, on_base, a["cost"], u["cost"], "Ya" if changed else "Tidak",
+                     "OK" if same else "GAGAL", "OK" if resp else "X"])
+        print(f"  {k:>2}. {eid} {level:<7} {on_base:<13} A*={fc(a['cost'])} UCS={fc(u['cost'])} "
+              f"{'berubah' if changed else 'tetap':<8}{'OK' if same else 'GAGAL':<6}"
+              f"respons {'OK' if resp else 'X'}")
+    print(f"  A* = UCS pada {ok}/{n} simulasi, respons tepat pada {n_resp}/{n} simulasi")
+    return rows
+
+
+def route_check(g):
+    """Sheet Route Check: jumlah jarak ruas (+ detour) dibanding total jarak rute Google Maps."""
+    rows, out = [], []
+    for r in read_table("Route Check"):
+        try:
+            google = num(r.get("google_km", ""))
+        except ValueError:
+            continue
+        cols = sorted((k for k in r if k.lower().startswith("edge_")), key=lambda k: int(k.split("_")[1]))
+        eids = [r[k] for k in cols if r[k]]
+        path = [p.strip() for p in r.get("node_path", "").split(">") if p.strip()]
+        missing = [e for e in eids if e not in g.edges]
+        if missing:
+            print(f"  {r['route']}: ruas {', '.join(missing)} tidak ada di graf")
+            continue
+        connected = len(eids) == len(path) - 1 and all(
+            {g.edges[e]["a"], g.edges[e]["b"]} == {path[i], path[i + 1]} for i, e in enumerate(eids))
+        detour = num(r.get("detour_km") or 0)
+        graph_km = sum(g.edges[e]["dist"] for e in eids) + detour
+        rows.append((r["route"], google, graph_km, round(graph_km - google, 6) + 0.0, connected))
+    if not rows:
+        return out
+    print(f"\nValidasi jarak graf terhadap Google Maps ({len(rows)} rute acuan):")
+    for name, google, graph_km, diff, connected in rows:
+        print(f"  {name[:42]:<44}Google {google:5.2f} km  graf {graph_km:5.2f} km  "
+              f"selisih {diff:+.2f}{'' if connected else '  (urutan ruas tidak sesuai node_path!)'}")
+        out.append([name, google, round(graph_km, 2), round(diff, 2), "OK" if connected else "X"])
+    worst = max(abs(d) for _, _, _, d, _ in rows)
+    print(f"  Selisih terbesar: {worst:.2f} km; jalur ruas sesuai node_path: "
+          f"{sum(c for *_, c in rows)}/{len(rows)}")
+    return out
+
+
+def save_results(rows, summary, sim, check):
+    """Simpan hasil evaluasi ke hasil_evaluasi.xlsx (atau .csv bila openpyxl tidak ada)."""
+    head = ["ID", "Skenario", "Awal", "Tujuan", "Algoritma", "Rute", "Jarak (km)", "Biaya",
+            "Simpul diekspansi", "Waktu (ms)", "Optimal", "Lewat ruas ditutup", "Lewat ruas berpenalti",
+            "Rute berubah"]
+    inf = lambda v: "INF" if isinstance(v, float) and v == math.inf else v
+    try:
+        from openpyxl import Workbook
+    except ImportError:
+        path = os.path.splitext(RESULT_FILE)[0] + ".csv"
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            w.writerow(head)
+            w.writerows([[inf(v) for v in r] for r in rows])
+        print(f"\nHasil per skenario disimpan ke {path}")
+        return
+    wb = Workbook()
+    sheets = [("Skenario", head, rows),
+              ("Ringkasan", ["Metrik", "Hasil"], summary),
+              ("Simulasi Kecelakaan", ["Run", "Ruas", "Tingkat", "Posisi", "Biaya A*", "Biaya UCS",
+                                       "Rute berubah", "A* = UCS", "Respons"], sim),
+              ("Cek Google Maps", ["Rute", "Google (km)", "Graf (km)", "Selisih (km)", "Jalur sesuai"], check)]
+    for i, (title, header, data) in enumerate(sheets):
+        ws = wb.active if i == 0 else wb.create_sheet()
+        ws.title = title
+        ws.append(header)
+        for r in data:
+            ws.append([inf(v) for v in r])
+    try:
+        wb.save(RESULT_FILE)
+        print(f"\nHasil evaluasi disimpan ke {RESULT_FILE}")
+    except PermissionError:
+        print(f"\nTidak bisa menyimpan {RESULT_FILE} (berkas sedang dibuka di Excel?)")
 
 
 # ------------------------------------------------------------------ GUI
@@ -361,6 +552,36 @@ def boxes_overlap(a, b):
     return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
 
 
+def segment_hits_box(x1, y1, x2, y2, box):
+    """Apakah garis (x1, y1)-(x2, y2) memotong kotak? (Liang-Barsky)"""
+    dx, dy = x2 - x1, y2 - y1
+    t0, t1 = 0.0, 1.0
+    for p, q in ((-dx, x1 - box[0]), (dx, box[2] - x1), (-dy, y1 - box[1]), (dy, box[3] - y1)):
+        if p == 0:
+            if q < 0:
+                return False
+        else:
+            t = q / p
+            if p < 0:
+                t0 = max(t0, t)
+            else:
+                t1 = min(t1, t)
+            if t0 > t1:
+                return False
+    return True
+
+
+def box_inside(box, W, H):
+    return box[0] >= 0 and box[1] >= 0 and box[2] <= W and box[3] <= H
+
+
+def clamp_box(box, W, H):
+    """Geser kotak seperlunya supaya seluruhnya berada di dalam kanvas W x H."""
+    dx = max(0 - box[0], 0) - max(box[2] - W, 0)
+    dy = max(0 - box[1], 0) - max(box[3] - H, 0)
+    return (box[0] + dx, box[1] + dy, box[2] + dx, box[3] + dy)
+
+
 def layout(g, W, H, margin=60):
     """Posisi gambar tiap simpul: skema dari x_km/y_km di tengah kanvas W x H.
 
@@ -375,16 +596,19 @@ def layout(g, W, H, margin=60):
     for n in g.nodes.values():
         n["sx"] = left + (n["kx"] - min(xs)) * scale
         n["sy"] = top + (max(ys) - n["ky"]) * scale
+    # dipakai untuk menjaga label tetap di kanvas dan untuk memetakan latar peta
+    g.view = dict(W=W, H=H, left=left, top=top, scale=scale, min_x=min(xs), max_y=max(ys))
 
 
-def run_gui(g, heuristic_note):
+def run_gui(g, heuristic_note, bg=None):
     import tkinter as tk
     from tkinter import font as tkfont
     from tkinter import ttk
 
     root = tk.Tk()
     root.title("Rute Aman Makassar - A*")
-    dis, state = {}, {"results": {}}
+    dis, state = {}, {"results": {}, "route_segs": []}
+    show_bg = tk.BooleanVar(value=True)
 
     layout(g, MIN_MAP, MIN_H)
     canvas = tk.Canvas(root, width=MIN_MAP, height=MIN_H, bg="white")
@@ -417,6 +641,9 @@ def run_gui(g, heuristic_note):
                         command=lambda: refresh()).pack(side="left", padx=(0, 8))
     ttk.Button(panel, text="Hapus semua gangguan",
                command=lambda: (dis.clear(), search())).pack(anchor="w", pady=6)
+    if bg:
+        ttk.Checkbutton(panel, text="Tampilkan latar peta", variable=show_bg,
+                        command=lambda: draw()).pack(anchor="w")
     hint = ttk.Label(panel, text="Klik garis jalan pada skema untuk menandai gangguan.", wraplength=320)
     hint.pack(anchor="w", fill="x")
     panel.bind("<Configure>", lambda ev: hint.config(wraplength=max(200, ev.width - 24)))
@@ -446,13 +673,21 @@ def run_gui(g, heuristic_note):
         canvas.create_text((box[0] + box[2]) / 2, (box[1] + box[3]) / 2, text=text,
                            font=font, fill=LABEL_TEXT_COLOR)
 
-    def first_free_box(centers, text, font, obstacles):
-        """Kotak label pada posisi pertama yang tidak menimpa simpul atau label lain."""
-        boxes = [label_box(cx, cy, text, font) for cx, cy in centers]
-        for box in boxes:
-            if not any(boxes_overlap(box, other) for other in obstacles):
-                return box
-        return boxes[0]
+    def best_box(centers, text, font, obstacles, anchor, skip_edge=None):
+        """Pilih posisi label dengan skor terkecil. Semua kandidat digeser masuk ke kanvas.
+        Skor: menimpa simpul/label lain (paling dihindari) > menutupi garis rute > jarak
+        dari titik acuan (label sebisa mungkin dekat ruas/simpulnya)."""
+        W, H = g.view["W"], g.view["H"]
+        best = None
+        for cx, cy in centers:
+            box = clamp_box(label_box(cx, cy, text, font), W, H)
+            hits = sum(boxes_overlap(box, other) for other in obstacles)
+            cross = sum(segment_hits_box(*seg, box) for eid, seg in state["route_segs"] if eid != skip_edge)
+            dist = math.hypot((box[0] + box[2]) / 2 - anchor[0], (box[1] + box[3]) / 2 - anchor[1])
+            score = hits * 1000 + cross * 150 + dist
+            if best is None or score < best[0]:
+                best = (score, box)
+        return best[1]
 
     def location_label_box(node, text, obstacles):
         """Label lokasi: coba di atas, bawah, kanan, lalu kiri lingkaran."""
@@ -465,23 +700,49 @@ def run_gui(g, heuristic_note):
             (node["sx"] + radius + gap + half_w, node["sy"]),
             (node["sx"] - radius - gap - half_w, node["sy"]),
         ]
-        return first_free_box(centers, text, location_font, obstacles)
+        # jarak ke pusat simpul sama untuk keempat posisi; urutan di atas jadi pemecah seri
+        return best_box(centers, text, location_font, obstacles, (node["sx"], node["sy"]))
+
+    def edge_mid(edge):
+        a, b = g.nodes[edge["a"]], g.nodes[edge["b"]]
+        return (a["sx"] + b["sx"]) / 2, (a["sy"] + b["sy"]) / 2
 
     def hazard_label_box(edge, text, obstacles):
-        """Label gangguan: di tengah ruas, atau digeser sedikit bila menutupi simpul."""
-        a, b = g.nodes[edge["a"]], g.nodes[edge["b"]]
-        mid_x, mid_y = (a["sx"] + b["sx"]) / 2, (a["sy"] + b["sy"]) / 2
-        step_x = hazard_font.measure(text) / 2
+        """Label gangguan: di tengah ruas, atau digeser ke tempat kosong terdekat."""
+        mid_x, mid_y = edge_mid(edge)
+        step_x = hazard_font.measure(text) / 4
         step_y = hazard_font.metrics("linespace") + 4
-        shifts = sorted(((col, row) for row in range(-3, 4) for col in range(-2, 3)),
-                        key=lambda shift: abs(shift[0]) + abs(shift[1]))
-        centers = [(mid_x + col * step_x, mid_y + row * step_y) for col, row in shifts]
-        return first_free_box(centers, text, hazard_font, obstacles)
+        centers = [(mid_x + col * step_x, mid_y + row * step_y)
+                   for row in range(-6, 7) for col in range(-8, 9)]
+        return best_box(centers, text, hazard_font, obstacles, (mid_x, mid_y), skip_edge=edge["id"])
+
+    def draw_background():
+        """Potong bagian peta yang terlihat di kanvas lalu ubah ukurannya ke ukuran kanvas."""
+        if not bg or not show_bg.get():
+            return
+        v = g.view
+        key = (v["W"], v["H"], v["scale"])
+        if state.get("bg_key") != key:
+            from PIL import Image, ImageTk
+            km_left = v["min_x"] - v["left"] / v["scale"]
+            km_right = v["min_x"] + (v["W"] - v["left"]) / v["scale"]
+            km_top = v["max_y"] + v["top"] / v["scale"]
+            km_bottom = v["max_y"] - (v["H"] - v["top"]) / v["scale"]
+            box = (bg["ax"] * km_left + bg["bx"], bg["ay"] * km_top + bg["by"],
+                   bg["ax"] * km_right + bg["bx"], bg["ay"] * km_bottom + bg["by"])
+            part = bg["image"].transform((int(v["W"]), int(v["H"])), Image.Transform.EXTENT, box,
+                                         Image.Resampling.BILINEAR)
+            state["bg_photo"], state["bg_key"] = ImageTk.PhotoImage(part), key
+        canvas.create_image(0, 0, image=state["bg_photo"], anchor="nw")
 
     def draw():
         canvas.delete("all")
+        draw_background()
         shown = state["results"].get(algo_var.get())
         on_route = set(shown["edges"]) if shown and shown["found"] else set()
+        state["route_segs"] = [(eid, (g.nodes[g.edges[eid]["a"]]["sx"], g.nodes[g.edges[eid]["a"]]["sy"],
+                                      g.nodes[g.edges[eid]["b"]]["sx"], g.nodes[g.edges[eid]["b"]]["sy"]))
+                               for eid in on_route]
         for e in g.edges.values():
             a, b = g.nodes[e["a"]], g.nodes[e["b"]]
             canvas.create_line(a["sx"], a["sy"], b["sx"], b["sy"], fill=ROAD_COLOR, width=2)
@@ -504,17 +765,27 @@ def run_gui(g, heuristic_note):
             canvas.create_oval(n["sx"] - r, n["sy"] - r, n["sx"] + r, n["sy"] + r,
                                fill=fill, outline="black", width=2)
             obstacles.append((n["sx"] - r - 2, n["sy"] - r - 2, n["sx"] + r + 2, n["sy"] + r + 2))
-        # label digambar paling akhir supaya berada di lapisan paling atas
-        for eid, (kind, level) in dis.items():
-            text = f"{kind.capitalize()} - {level}"
-            box = hazard_label_box(g.edges[eid], text, obstacles)
-            draw_label(box, text, hazard_font, LEVEL_COLOR[level])
-            obstacles.append(box)
+        # posisi label lokasi dulu (melekat ke simpulnya), lalu label gangguan di sisa ruang
+        labels = []
         for n in g.nodes.values():
             if n["kind"] == "location":
                 box = location_label_box(n, n["id"], obstacles)
-                draw_label(box, n["id"], location_font, "#9e9e9e")
+                labels.append((box, n["id"], location_font, "#9e9e9e"))
                 obstacles.append(box)
+        for eid, (kind, level) in dis.items():
+            text = f"{kind.capitalize()} - {level}"
+            box = hazard_label_box(g.edges[eid], text, obstacles)
+            obstacles.append(box)
+            labels.append((box, text, hazard_font, LEVEL_COLOR[level]))
+            # label yang tergeser jauh dari ruasnya diberi garis penunjuk ke tengah ruas
+            mx, my = edge_mid(g.edges[eid])
+            px, py = min(max(mx, box[0]), box[2]), min(max(my, box[1]), box[3])
+            if math.hypot(px - mx, py - my) > 6:
+                canvas.create_line(mx, my, px, py, fill=LEVEL_COLOR[level], width=1, dash=(2, 2))
+                canvas.create_oval(mx - 2, my - 2, mx + 2, my + 2, fill=LEVEL_COLOR[level], outline="")
+        # label digambar paling akhir supaya berada di lapisan paling atas
+        for box, text, font, outline in labels:
+            draw_label(box, text, font, outline)
 
     def show_results():
         res = state["results"]
@@ -635,4 +906,8 @@ if __name__ == "__main__":
     if "--eval" in sys.argv:
         evaluate(graph)
     else:
-        run_gui(graph, note)
+        background, map_note = load_background(graph)
+        if map_note:
+            print(map_note)
+            note += "\n" + map_note
+        run_gui(graph, note, background)
